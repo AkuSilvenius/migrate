@@ -602,6 +602,97 @@ func TestParallelSchema(t *testing.T) {
 	})
 }
 
+func TestPostgres_TryAdvisoryLock(t *testing.T) {
+	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		// GIVEN
+		ip, port, err := c.FirstPort()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		addr := pgConnectionString(ip, port)
+		p := &Postgres{}
+		d, err := p.Open(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := d.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+
+		mustRun(t, d, []string{
+			"CREATE TABLE books (title text)",
+		})
+
+		var ok bool
+		if err := d.(*Postgres).conn.QueryRowContext(context.Background(), "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'books' AND table_schema = (SELECT current_schema()))").Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatalf("expected table to exist")
+		}
+
+		// generate some data so indexing is not instant
+		insertQuery := `INSERT INTO books (title) SELECT md5(random()::text) FROM generate_series(1, 1000000) s(i);`
+		if _, err := d.(*Postgres).conn.ExecContext(context.Background(), insertQuery); err != nil {
+			t.Fatal(err)
+		}
+
+		db, err := sql.Open("postgres", pgConnectionString(ip, port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+
+		// WHEN
+		const concurrency = 2
+		db.SetMaxIdleConns(concurrency)
+		db.SetMaxOpenConns(concurrency)
+
+		var wg sync.WaitGroup
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				dr, err := WithInstance(db, &Config{})
+				if err != nil {
+					t.Errorf("WithInstance: %v", err)
+				}
+				defer func() {
+					if err := dr.Close(); err != nil {
+						t.Error(err)
+					}
+				}()
+				if err := dr.Run(strings.NewReader("CREATE INDEX CONCURRENTLY idx_title ON books (title)")); err != nil {
+					t.Errorf("process %d error: %v", i, err)
+				}
+			}(i)
+		}
+
+		wg.Wait()
+
+		// THEN
+		var indexDef string
+		if err := d.(*Postgres).conn.QueryRowContext(context.Background(),
+			"SELECT indexdef FROM pg_indexes WHERE schemaname = (SELECT current_schema()) AND indexname = 'idx_title'",
+		).Scan(&indexDef); err != nil {
+			t.Fatal(err)
+		}
+
+		// deadlock will result in an INVALID index
+		// https://www.postgresql.org/docs/current/sql-createindex.html
+		if strings.Contains(indexDef, "INVALID") {
+			t.Fatalf("did not expect INVALID index")
+		}
+	})
+}
+
 func TestPostgres_Lock(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
 		ip, port, err := c.FirstPort()
