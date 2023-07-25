@@ -234,19 +234,39 @@ func (p *Postgres) Close() error {
 // https://www.postgresql.org/docs/9.6/static/explicit-locking.html#ADVISORY-LOCKS
 func (p *Postgres) Lock() error {
 	return database.CasRestoreOnErr(&p.isLocked, false, true, database.ErrLocked, func() error {
-		aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
-		if err != nil {
-			return err
-		}
+		for {
+			ok, err := p.tryLock()
+			if err != nil {
+				return fmt.Errorf("p.tryLock: %w", err)
+			}
 
-		// This will wait indefinitely until the lock can be acquired.
-		query := `SELECT pg_advisory_lock($1)`
-		if _, err := p.conn.ExecContext(context.Background(), query, aid); err != nil {
-			return &database.Error{OrigErr: err, Err: "try lock failed", Query: []byte(query)}
+			if ok {
+				break
+			}
+
+			time.Sleep(100 * time.Millisecond)
 		}
 
 		return nil
 	})
+}
+
+func (p *Postgres) tryLock() (bool, error) {
+	aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
+	if err != nil {
+		return false, err
+	}
+
+	query := `SELECT pg_try_advisory_lock($1)`
+	var ok bool
+	fmt.Printf("[%s] trying to lock aid [%s]\n", time.Now().String(), aid)
+	if err := p.conn.QueryRowContext(context.Background(), query, aid).Scan(&ok); err != nil {
+		return false, &database.Error{OrigErr: err, Err: "pg_try_advisory_lock failed", Query: []byte(query)}
+	}
+
+	fmt.Printf("[%s] lock aid [%s] ok: %v\n", time.Now().String(), aid, ok)
+
+	return ok, nil
 }
 
 func (p *Postgres) Unlock() error {
@@ -256,10 +276,12 @@ func (p *Postgres) Unlock() error {
 			return err
 		}
 
+		fmt.Printf("[%s] unlocking aid [%s]\n", time.Now().String(), aid)
 		query := `SELECT pg_advisory_unlock($1)`
 		if _, err := p.conn.ExecContext(context.Background(), query, aid); err != nil {
 			return &database.Error{OrigErr: err, Query: []byte(query)}
 		}
+		fmt.Printf("[%s] unlocked aid [%s]\n", time.Now().String(), aid)
 		return nil
 	})
 }
@@ -295,6 +317,8 @@ func (p *Postgres) runStatement(statement []byte) error {
 	if strings.TrimSpace(query) == "" {
 		return nil
 	}
+
+	fmt.Printf("[%s] Running statement: \n%s\n", time.Now().String(), query)
 	if _, err := p.conn.ExecContext(ctx, query); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok {
 			var line uint
