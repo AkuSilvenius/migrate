@@ -35,10 +35,10 @@ var (
 		PortRequired: true, ReadyFunc: isReady}
 	// Supported versions: https://www.postgresql.org/support/versioning/
 	specs = []dktesting.ContainerSpec{
-		// {ImageName: "postgres:9.5", Options: opts},
-		// {ImageName: "postgres:9.6", Options: opts},
-		// {ImageName: "postgres:10", Options: opts},
-		// {ImageName: "postgres:11", Options: opts},
+		{ImageName: "postgres:9.5", Options: opts},
+		{ImageName: "postgres:9.6", Options: opts},
+		{ImageName: "postgres:10", Options: opts},
+		{ImageName: "postgres:11", Options: opts},
 		{ImageName: "postgres:12", Options: opts},
 	}
 )
@@ -602,81 +602,46 @@ func TestParallelSchema(t *testing.T) {
 	})
 }
 
-func TestPostgres_TryAdvisoryLock(t *testing.T) {
+func TestPostgres_ConcurrentMigrations(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
 		// GIVEN
+		const concurrency = 3
+		var wg sync.WaitGroup
+
 		ip, port, err := c.FirstPort()
 		if err != nil {
 			t.Fatal(err)
 		}
-
 		addr := pgConnectionString(ip, port)
-		p := &Postgres{}
-		d, err := p.Open(addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
-
-		mustRun(t, d, []string{
-			"CREATE TABLE books (title text)",
-
-			// generate some data so indexing is not instant
-			"INSERT INTO books (title) SELECT md5(random()::text) FROM generate_series(1, 1000000) s(i)",
-		})
 
 		// WHEN
-		const concurrency = 3
-
-		var wg sync.WaitGroup
 		for i := 0; i < concurrency; i++ {
 			wg.Add(1)
 
 			go func(i int) {
 				defer wg.Done()
 
-				db, err := sql.Open("postgres", pgConnectionString(ip, port))
+				p := &Postgres{}
+				d, err := p.Open(addr)
 				if err != nil {
 					t.Error(err)
 				}
 				defer func() {
-					if err := db.Close(); err != nil {
+					if err := d.Close(); err != nil {
 						t.Error(err)
 					}
 				}()
-
-				tested, err := WithInstance(db, &Config{})
+				m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "postgres", d)
 				if err != nil {
-					t.Errorf("WithInstance: %v", err)
+					t.Error(err)
 				}
-				defer func() {
-					if err := tested.Close(); err != nil {
-						t.Error(err)
-					}
-				}()
-				if err := tested.Run(strings.NewReader("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_books_title ON books (title)")); err != nil {
-					t.Errorf("process %d error: %v", i, err)
-				}
+				dt.TestMigrate(t, m)
 			}(i)
 		}
 
 		wg.Wait()
 
 		// THEN
-		var ok bool
-		if err := d.(*Postgres).conn.QueryRowContext(context.Background(),
-			"SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_books_title')",
-		).Scan(&ok); err != nil {
-			t.Fatal(err)
-		}
-
-		if !ok {
-			t.Fatalf("did not find index after creation")
-		}
 	})
 }
 
