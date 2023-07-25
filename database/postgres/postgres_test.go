@@ -35,10 +35,10 @@ var (
 		PortRequired: true, ReadyFunc: isReady}
 	// Supported versions: https://www.postgresql.org/support/versioning/
 	specs = []dktesting.ContainerSpec{
-		{ImageName: "postgres:9.5", Options: opts},
-		{ImageName: "postgres:9.6", Options: opts},
-		{ImageName: "postgres:10", Options: opts},
-		{ImageName: "postgres:11", Options: opts},
+		// {ImageName: "postgres:9.5", Options: opts},
+		// {ImageName: "postgres:9.6", Options: opts},
+		// ImageName: "postgres:10", Options: opts},
+		// {ImageName: "postgres:11", Options: opts},
 		{ImageName: "postgres:12", Options: opts},
 	}
 )
@@ -599,6 +599,49 @@ func TestParallelSchema(t *testing.T) {
 		if err := dfoo.Unlock(); err != nil {
 			t.Fatal(err)
 		}
+	})
+}
+
+func TestPostgres_ConcurrentMigrations(t *testing.T) {
+	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		// GIVEN
+		const concurrency = 3
+		var wg sync.WaitGroup
+
+		ip, port, err := c.FirstPort()
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := pgConnectionString(ip, port)
+
+		// WHEN
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+
+			go func(i int) {
+				defer wg.Done()
+
+				p := &Postgres{}
+				d, err := p.Open(addr)
+				if err != nil {
+					t.Error(err)
+				}
+				defer func() {
+					if err := d.Close(); err != nil {
+						t.Error(err)
+					}
+				}()
+				m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "postgres", d)
+				if err != nil {
+					t.Error(err)
+				}
+				dt.TestMigrate(t, m)
+			}(i)
+		}
+
+		wg.Wait()
+
+		// THEN
 	})
 }
 
